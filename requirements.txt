@@ -1,0 +1,5 @@
+streamlit
+pyairtable
+numpy
+matplotlib
+openai
