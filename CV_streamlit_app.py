@@ -27,9 +27,9 @@ from openai import OpenAI
 # CONFIG — edit these directly or use Streamlit secrets
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-AIRTABLE_TOKEN = "patBAN9jcAPDprg05.8a52f449c3991cc6b9128bcacb121aab604f473ed7df5122689f920a1682b526"
+AIRTABLE_TOKEN = st.secrets["AIRTABLE_TOKEN"]
 AIRTABLE_BASE_ID = "appRLn9u0Ws72LkWL"
-OPENAI_API_KEY = "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"
+OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 
 PROGRAM_NAME = "OIT 277 — CV Matching Lab"
 EMBEDDING_MODEL = "text-embedding-3-small"
