@@ -1,0 +1,612 @@
+"""
+CV Match Explorer — Interactive Streamlit App
+==============================================
+
+Students pick their name, choose a matching algorithm, and see results.
+Custom Weighted mode lets students adjust per-field weights in real-time.
+
+HOW TO RUN LOCALLY:
+  1. pip install -r requirements.txt
+  2. streamlit run streamlit_app.py
+
+DEPLOY TO STREAMLIT CLOUD:
+  1. Push to a GitHub repo
+  2. Go to share.streamlit.io -> New app -> select this file
+  3. Add secrets (AIRTABLE_TOKEN, OPENAI_API_KEY) in Advanced Settings
+  4. Deploy — students get a URL, no install needed
+"""
+
+import streamlit as st
+import numpy as np
+import time
+from collections import Counter
+from pyairtable import Api as AirtableApi
+from openai import OpenAI
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CONFIG — edit these directly or use Streamlit secrets
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+AIRTABLE_TOKEN = "patBAN9jcAPDprg05.8a52f449c3991cc6b9128bcacb121aab604f473ed7df5122689f920a1682b526"
+AIRTABLE_BASE_ID = "appRLn9u0Ws72LkWL"
+OPENAI_API_KEY = "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"
+
+PROGRAM_NAME = "OIT 277 — CV Matching Lab"
+EMBEDDING_MODEL = "text-embedding-3-small"
+
+PROFILE_FIELDS = [
+    "Academic Background",
+    "Professional Background",
+    "Key Skills",
+    "What I'm Looking For",
+]
+
+TABLE_MAP = {
+    "Class Profiles": "Candidates_Class",
+    "Practice Data (Synthetic)": "Candidates_Synthetic",
+}
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# PAGE CONFIG & STYLES
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+st.set_page_config(page_title="Match Explorer", page_icon="🎯", layout="wide")
+
+st.markdown("""
+<style>
+    /* ── Background image (Stanford GSB Knight Management Center) ── */
+    .stApp {
+        background-image: url("https://upload.wikimedia.org/wikipedia/commons/thumb/4/4e/Knight_Management_Center_-_Stanford_GSB.jpg/1280px-Knight_Management_Center_-_Stanford_GSB.jpg");
+        background-size: cover;
+        background-position: center;
+        background-attachment: fixed;
+    }
+    /* Semi-transparent white overlay on main content for readability */
+    .main .block-container {
+        background: rgba(255, 255, 255, 0.92);
+        border-radius: 16px;
+        padding: 2rem 3rem;
+        margin-top: 1rem;
+    }
+    /* ── Cards & components ── */
+    .match-card {
+        background: white;
+        border-radius: 12px;
+        padding: 24px;
+        margin-bottom: 16px;
+        border: 1px solid #e8e8e8;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+    }
+    .explanation-box {
+        background: #f8f7ff;
+        border-radius: 8px;
+        padding: 14px;
+        margin: 12px 0;
+        font-size: 15px;
+        line-height: 1.6;
+        color: #444;
+    }
+    div[data-testid="stMetric"] {
+        background: white;
+        border: 1px solid #eee;
+        border-radius: 8px;
+        padding: 12px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# HELPER FUNCTIONS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def cosine_sim(a, b):
+    a, b = np.array(a), np.array(b)
+    d = np.linalg.norm(a) * np.linalg.norm(b)
+    return float(np.dot(a, b) / d) if d > 0 else 0.0
+
+
+def embedding_score(embeddings, name_a, name_b):
+    """Average cosine similarity across all profile fields."""
+    scores = []
+    for f in PROFILE_FIELDS:
+        ea = embeddings[name_a].get(f)
+        eb = embeddings[name_b].get(f)
+        if ea is not None and eb is not None:
+            scores.append(cosine_sim(ea, eb))
+    return round(np.mean(scores), 4) if scores else 0.0
+
+
+def skills_gap_score(embeddings, name_a, name_b, penalty=0.3):
+    """Fit (goals->skills) minus redundancy penalty."""
+    goals_field = "What I'm Looking For"
+    skills_field = "Key Skills"
+
+    def directed(seeker, provider):
+        seeker_goals = embeddings[seeker].get(goals_field)
+        provider_skills = embeddings[provider].get(skills_field)
+        seeker_skills = embeddings[seeker].get(skills_field)
+        if seeker_goals is None or provider_skills is None:
+            return None
+        fit = cosine_sim(seeker_goals, provider_skills)
+        redundancy = cosine_sim(seeker_skills, provider_skills) if seeker_skills is not None else 0.0
+        return fit - penalty * redundancy
+
+    a_to_b = directed(name_a, name_b)
+    b_to_a = directed(name_b, name_a)
+    valid = [s for s in [a_to_b, b_to_a] if s is not None]
+    return round(np.mean(valid), 4) if valid else 0.0
+
+
+def complementarity_score(embeddings, name_a, name_b):
+    """A's skills+background vs B's goals, both directions."""
+    supply_fields = ["Key Skills", "Professional Background"]
+    demand_field = "What I'm Looking For"
+
+    def directed(supplier, demander):
+        d_emb = embeddings[demander].get(demand_field)
+        if d_emb is None:
+            return None
+        scs = [cosine_sim(embeddings[supplier][f], d_emb)
+               for f in supply_fields if embeddings[supplier].get(f) is not None]
+        return np.mean(scs) if scs else None
+
+    valid = [s for s in [directed(name_a, name_b), directed(name_b, name_a)] if s is not None]
+    return round(np.mean(valid), 4) if valid else 0.0
+
+
+def custom_weighted_score(embeddings, name_a, name_b, weights):
+    """Weighted average of per-field cosine similarities."""
+    total_weight = sum(weights.values())
+    if total_weight == 0:
+        return 0.0
+    weighted_sum = 0.0
+    used_weight = 0.0
+    for f in PROFILE_FIELDS:
+        ea = embeddings[name_a].get(f)
+        eb = embeddings[name_b].get(f)
+        if ea is not None and eb is not None:
+            weighted_sum += weights[f] * cosine_sim(ea, eb)
+            used_weight += weights[f]
+    return round(weighted_sum / used_weight, 4) if used_weight > 0 else 0.0
+
+
+def run_matching(embeddings, names, scorer_fn, top_n=3):
+    """Run a matching algorithm for all candidates."""
+    results = {}
+    for person in names:
+        scored = [{"match": other, "score": scorer_fn(person, other)}
+                  for other in names if other != person]
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        results[person] = scored[:top_n]
+    return results
+
+
+def marketplace_stats(match_results, all_names):
+    """Compute proposal concentration stats."""
+    proposal_count = Counter()
+    for name, matches in match_results.items():
+        for m in matches:
+            proposal_count[m["match"]] += 1
+    for name in all_names:
+        if name not in proposal_count:
+            proposal_count[name] = 0
+    counts = sorted(proposal_count.values())
+    n = len(counts)
+    if sum(counts) > 0:
+        gini = (2 * sum((i + 1) * c for i, c in enumerate(counts))
+                - (n + 1) * sum(counts)) / (n * sum(counts))
+    else:
+        gini = 0
+    return {
+        "counts": proposal_count,
+        "gini": gini,
+        "top5": proposal_count.most_common(5),
+        "bottom5": proposal_count.most_common()[:-6:-1],
+    }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# DATA LOADING & EMBEDDING GENERATION
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@st.cache_data(ttl=600)
+def load_profiles(table_name):
+    """Load candidate profiles from Airtable."""
+    api = AirtableApi(AIRTABLE_TOKEN)
+    tbl = api.table(AIRTABLE_BASE_ID, table_name)
+    records = tbl.all()
+    candidates = []
+    for record in records:
+        row = {"record_id": record["id"]}
+        for field in ["Name", "Email"] + PROFILE_FIELDS:
+            row[field] = record["fields"].get(field, "")
+        candidates.append(row)
+    return candidates
+
+
+def compute_embeddings(candidates_list, table_name):
+    """Generate embeddings for all profiles. Cached in session_state per table."""
+    cache_key = "embeddings_{}".format(table_name)
+    if cache_key in st.session_state:
+        return st.session_state[cache_key]
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    embeddings = {}
+    total = len(candidates_list) * len(PROFILE_FIELDS)
+    done = 0
+
+    progress_bar = st.progress(0, text="Computing embeddings — this only runs once...")
+    status = st.empty()
+
+    for row in candidates_list:
+        name = row["Name"]
+        embeddings[name] = {}
+        status.caption("Embedding: {}".format(name))
+        for field in PROFILE_FIELDS:
+            text = row[field]
+            if text and text.strip():
+                resp = client.embeddings.create(model=EMBEDDING_MODEL, input=text.strip())
+                embeddings[name][field] = resp.data[0].embedding
+                time.sleep(0.05)
+            else:
+                embeddings[name][field] = None
+            done += 1
+            progress_bar.progress(
+                done / total,
+                text="Computing embeddings — {}/{} fields done".format(done, total),
+            )
+
+    progress_bar.empty()
+    status.empty()
+
+    st.session_state[cache_key] = embeddings
+    return embeddings
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# SIDEBAR
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+with st.sidebar:
+    st.header("🎯 Match Explorer")
+    st.markdown("---")
+
+    table_choice = st.radio(
+        "📋 Data Source",
+        list(TABLE_MAP.keys()),
+        index=0,
+        help="Class Profiles = real student data. Practice Data = synthetic profiles.",
+    )
+    table_name = TABLE_MAP[table_choice]
+
+    st.markdown("---")
+
+    algorithm = st.radio(
+        "🧮 Algorithm",
+        ["Embedding Similarity", "Skills-Gap", "Complementarity", "Custom Weighted"],
+        index=0,
+        help=(
+            "**Embedding Similarity**: full-profile cosine similarity.\n\n"
+            "**Skills-Gap**: fit (goals→skills) minus redundancy penalty.\n\n"
+            "**Complementarity**: supply meets demand, both directions.\n\n"
+            "**Custom Weighted**: you set the weight for each profile field."
+        ),
+    )
+
+    # Algorithm-specific controls
+    sg_penalty = 0.3
+    field_weights = {f: 25 for f in PROFILE_FIELDS}
+
+    if algorithm == "Skills-Gap":
+        st.markdown("---")
+        sg_penalty = st.slider(
+            "Redundancy Penalty",
+            min_value=0.0, max_value=1.0, value=0.3, step=0.05,
+            help="0 = ignore redundancy. 1 = heavily penalize skill overlap.",
+        )
+
+    if algorithm == "Custom Weighted":
+        st.markdown("---")
+        st.markdown("**Field Weights**")
+        st.caption("Drag to set relative importance of each field.")
+        for f in PROFILE_FIELDS:
+            field_weights[f] = st.slider(f, min_value=0, max_value=100, value=25, key=f"w_{f}")
+
+    st.markdown("---")
+    top_n = st.slider("Top N matches", min_value=1, max_value=10, value=3)
+
+    st.markdown("---")
+    if st.button("🔄 Refresh Data"):
+        st.cache_data.clear()
+        for key in list(st.session_state.keys()):
+            if key.startswith("embeddings_"):
+                del st.session_state[key]
+        st.rerun()
+
+    st.markdown("---")
+    st.caption("Powered by OpenAI embeddings")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# LOAD DATA
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+st.markdown(
+    "<div style='text-align:left;padding:4px 0 2px;'>"
+    "<h1 style='font-size:2.5rem;font-weight:800;color:#1a1a1a;margin:0;line-height:1.1;'>"
+    "🎯 Match Explorer</h1>"
+    "<h2 style='font-size:1.5rem;font-weight:600;color:#8C1515;margin:6px 0 0 0;'>"
+    "{}</h2></div>".format(PROGRAM_NAME),
+    unsafe_allow_html=True,
+)
+
+try:
+    candidates_list = load_profiles(table_name)
+except Exception as e:
+    st.error("Could not connect to Airtable: {}".format(e))
+    st.stop()
+
+if not candidates_list:
+    st.warning("No candidates found in the selected data source.")
+    st.stop()
+
+# Build a lookup dict
+candidates = {row["Name"]: row for row in candidates_list}
+names = sorted(candidates.keys())
+
+# Generate embeddings (shows progress bar on first load; cached in session_state after)
+embeddings = compute_embeddings(candidates_list, table_name)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# BUILD SCORER FUNCTION
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if algorithm == "Embedding Similarity":
+    def scorer(a, b):
+        return embedding_score(embeddings, a, b)
+elif algorithm == "Skills-Gap":
+    def scorer(a, b):
+        return skills_gap_score(embeddings, a, b, penalty=sg_penalty)
+elif algorithm == "Complementarity":
+    def scorer(a, b):
+        return complementarity_score(embeddings, a, b)
+else:  # Custom Weighted
+    def scorer(a, b):
+        return custom_weighted_score(embeddings, a, b, field_weights)
+
+# Run matching
+match_results = run_matching(embeddings, names, scorer, top_n=top_n)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TABS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+tab_individual, tab_aggregate = st.tabs(["👤 My Matches", "📊 Aggregate Analytics"])
+
+
+# ══════════════════════════════════════════════════════
+# TAB 1: MY MATCHES
+# ══════════════════════════════════════════════════════
+
+with tab_individual:
+    st.markdown("Select your name and an algorithm in the sidebar to see your matches.")
+
+    col_select, col_stats = st.columns([2, 1])
+    with col_select:
+        selected_name = st.selectbox("👤 Your name:", names)
+    with col_stats:
+        st.metric("Total Candidates", len(names))
+
+    person = candidates[selected_name]
+
+    # Profile summary
+    with st.expander("📋 Your Profile", expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**🎓 Academic:** {}".format(person.get("Academic Background", "")))
+            st.markdown("**💼 Professional:** {}".format(person.get("Professional Background", "")))
+        with col2:
+            st.markdown("**🛠 Skills:** {}".format(person.get("Key Skills", "")))
+            st.markdown("**🔍 Looking for:** {}".format(person.get("What I'm Looking For", "")))
+
+    st.markdown("---")
+    st.subheader("Your Top {} Matches — {}".format(top_n, algorithm))
+
+    my_matches = match_results[selected_name]
+    medals = ["🥇", "🥈", "🥉"]
+
+    for i, m in enumerate(my_matches):
+        match_name = m["match"]
+        score = m["score"]
+        medal = medals[i] if i < 3 else "**#{}**".format(i + 1)
+
+        # Compute per-field breakdowns
+        field_scores = {}
+        for f in PROFILE_FIELDS:
+            ea = embeddings[selected_name].get(f)
+            eb = embeddings[match_name].get(f)
+            if ea is not None and eb is not None:
+                field_scores[f] = cosine_sim(ea, eb)
+
+        # Card
+        st.markdown(
+            """<div class="match-card">
+                <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;">
+                    <span style="font-size:32px;">{medal}</span>
+                    <div>
+                        <div style="font-size:20px;font-weight:700;color:#1a1a1a;">{name}</div>
+                        <div style="font-size:15px;color:#6B4DE6;font-weight:600;">{score:.1%} match score</div>
+                    </div>
+                </div>
+            </div>""".format(medal=medal, name=match_name, score=score),
+            unsafe_allow_html=True,
+        )
+
+        # Field breakdown as progress bars
+        if field_scores:
+            cols = st.columns(len(field_scores))
+            for j, (field_name, field_score) in enumerate(field_scores.items()):
+                with cols[j]:
+                    short_name = field_name.replace("What I'm Looking For", "Goals").replace("Professional Background", "Professional").replace("Academic Background", "Academic").replace("Key Skills", "Skills")
+                    st.caption(short_name)
+                    st.progress(min(max(field_score, 0.0), 1.0), text="{:.0%}".format(field_score))
+
+        st.markdown("")
+
+    # Peek at match profiles
+    st.markdown("---")
+    st.subheader("👀 Learn More About a Match")
+
+    match_names_list = [m["match"] for m in my_matches]
+    if match_names_list:
+        peek_name = st.selectbox("Select a match:", match_names_list)
+        if peek_name in candidates:
+            peek = candidates[peek_name]
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.markdown("**🎓 Academic:** {}".format(peek.get("Academic Background", "")))
+                st.markdown("**💼 Professional:** {}".format(peek.get("Professional Background", "")))
+            with col_b:
+                st.markdown("**🛠 Skills:** {}".format(peek.get("Key Skills", "")))
+                st.markdown("**🔍 Looking for:** {}".format(peek.get("What I'm Looking For", "")))
+
+    # Cross-algorithm comparison
+    st.markdown("---")
+    st.subheader("🔀 Cross-Algorithm Comparison")
+    st.caption("How your top matches score under each algorithm:")
+
+    comparison_data = []
+    for m in my_matches:
+        mn = m["match"]
+        comparison_data.append({
+            "Match": mn,
+            "Embedding": "{:.1%}".format(embedding_score(embeddings, selected_name, mn)),
+            "Skills-Gap": "{:.1%}".format(skills_gap_score(embeddings, selected_name, mn, penalty=sg_penalty)),
+            "Complementarity": "{:.1%}".format(complementarity_score(embeddings, selected_name, mn)),
+        })
+    st.table(comparison_data)
+
+
+# ══════════════════════════════════════════════════════
+# TAB 2: AGGREGATE ANALYTICS
+# ══════════════════════════════════════════════════════
+
+with tab_aggregate:
+    st.subheader("📊 Aggregate Analytics — {}".format(algorithm))
+    st.markdown("How does the **{}** algorithm perform across all {} candidates?".format(
+        algorithm, len(names)))
+
+    stats = marketplace_stats(match_results, names)
+    counts = list(stats["counts"].values())
+
+    # All scores
+    all_top1_scores = []
+    all_scores = []
+    for name in names:
+        matches = match_results[name]
+        if matches:
+            all_top1_scores.append(matches[0]["score"])
+            for m in matches:
+                all_scores.append(m["score"])
+
+    # Summary metrics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Avg Top-1 Score", "{:.1%}".format(np.mean(all_top1_scores)) if all_top1_scores else "N/A")
+    with col2:
+        st.metric("Median Top-1 Score", "{:.1%}".format(np.median(all_top1_scores)) if all_top1_scores else "N/A")
+    with col3:
+        proposed_any = sum(1 for c in counts if c > 0)
+        st.metric(
+            "Coverage",
+            "{:.0%}".format(proposed_any / len(names)) if names else "N/A",
+            help=(
+                "The share of candidates who appear in at least one other person's "
+                "top-N match list. 100% means nobody is completely overlooked by "
+                "the algorithm; lower values indicate some profiles are never recommended."
+            ),
+        )
+    with col4:
+        st.metric(
+            "Gini Coefficient",
+            "{:.3f}".format(stats["gini"]),
+            help=(
+                "Measures how unevenly proposals are distributed across candidates. "
+                "0 = perfectly equal (everyone is proposed the same number of times). "
+                "1 = maximally concentrated (one person gets all proposals). "
+                "Above 0.3 suggests a few 'match magnets' dominate the results."
+            ),
+        )
+
+    st.markdown("---")
+
+    # Charts
+    import matplotlib.pyplot as plt
+
+    col_chart1, col_chart2 = st.columns(2)
+
+    with col_chart1:
+        st.markdown("### Distribution of Best Match Quality")
+        fig1, ax1 = plt.subplots(figsize=(6, 4))
+        ax1.hist(all_top1_scores, bins=15, color="#6B4DE6", alpha=0.7,
+                 edgecolor="white", linewidth=0.8)
+        if all_top1_scores:
+            ax1.axvline(np.mean(all_top1_scores), color="#E4572E", linestyle="--",
+                         linewidth=1.5, label="Mean: {:.1%}".format(np.mean(all_top1_scores)))
+        ax1.set_xlabel("Top-1 Match Score")
+        ax1.set_ylabel("Number of Candidates")
+        ax1.legend()
+        plt.tight_layout()
+        st.pyplot(fig1)
+
+    with col_chart2:
+        st.markdown("### Proposal Concentration")
+        fig2, ax2 = plt.subplots(figsize=(6, 4))
+        sorted_counts = sorted(counts, reverse=True)
+        ax2.bar(range(len(sorted_counts)), sorted_counts, color="#1B9AAA",
+                alpha=0.7, edgecolor="white", linewidth=0.5)
+        ax2.set_xlabel("Candidate (ranked by times proposed)")
+        ax2.set_ylabel("Times Proposed")
+        if counts:
+            ax2.axhline(np.mean(counts), color="#E4572E", linestyle="--",
+                         linewidth=1.5, label="Mean: {:.1f}".format(np.mean(counts)))
+        ax2.legend()
+        plt.tight_layout()
+        st.pyplot(fig2)
+
+    st.markdown("---")
+
+    # Match magnets and never-proposed
+    col_mag, col_never = st.columns(2)
+
+    with col_mag:
+        st.markdown("### 🧲 Match Magnets")
+        for name, count in stats["top5"]:
+            st.markdown("- **{}**: proposed {}x".format(name, count))
+
+    with col_never:
+        st.markdown("### 🕳 Never Proposed")
+        never = [n for n, c in stats["counts"].items() if c == 0]
+        if never:
+            st.markdown("{} candidates appear in nobody's top-{} list:".format(len(never), top_n))
+            for name in never[:10]:
+                st.markdown("- {}".format(name))
+            if len(never) > 10:
+                st.markdown("- *...and {} more*".format(len(never) - 10))
+        else:
+            st.success("Every candidate appears in at least one match list!")
+
+    st.markdown("---")
+    if stats["gini"] > 0.3:
+        st.info("Gini = {:.3f} — High concentration: a few profiles dominate proposals.".format(stats["gini"]))
+    elif stats["gini"] < 0.15:
+        st.success("Gini = {:.3f} — Fairly equal distribution of proposals.".format(stats["gini"]))
+    else:
+        st.warning("Gini = {:.3f} — Moderate concentration of proposals.".format(stats["gini"]))
+
+
+# Footer
+st.markdown("---")
+st.caption("Built with Streamlit · Semantic matching powered by OpenAI embeddings")
