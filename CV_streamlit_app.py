@@ -552,43 +552,6 @@ with tab_individual:
                     st.caption(short_name)
                     st.progress(min(max(field_score, 0.0), 1.0), text="{:.0%}".format(field_score))
 
-        # LLM explanation
-        llm_key = "llm_{}_{}_{}_{}".format(selected_name, match_name, algorithm, table_name)
-        col_btn, _ = st.columns([1, 3])
-        with col_btn:
-            if st.button("🤖 Explain this match", key="btn_{}".format(llm_key)):
-                with st.spinner("Asking GPT-4o-mini..."):
-                    result = call_llm(
-                        selected_name, match_name, candidates,
-                        field_scores, score, algorithm,
-                        st.session_state.get("llm_prompt", DEFAULT_PROMPT),
-                    )
-                st.session_state[llm_key] = result
-
-        if llm_key in st.session_state:
-            result = st.session_state[llm_key]
-            if result:
-                llm_score = result.get("score", "?")
-                fit_drivers = result.get("fit_drivers", [])
-                complementary = result.get("complementary_value", "")
-                friction = result.get("friction", "")
-                st.markdown(
-                    "<div class='explanation-box'>"
-                    "<strong>🤖 LLM Assessment: {}/10</strong><br><br>"
-                    "<strong>Why it works:</strong><br>{}"
-                    "<br><br><strong>Complementary value:</strong><br>{}"
-                    "<br><br><strong>Potential friction:</strong><br>{}"
-                    "</div>".format(
-                        llm_score,
-                        "<br>".join("• {}".format(d) for d in fit_drivers),
-                        complementary,
-                        friction,
-                    ),
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.warning("LLM call failed — check your API key or try again.")
-
         st.markdown("")
 
     # Peek at match profiles
@@ -607,6 +570,54 @@ with tab_individual:
             with col_b:
                 st.markdown("**🛠 Skills:** {}".format(peek.get("Key Skills", "")))
                 st.markdown("**🔍 Looking for:** {}".format(peek.get("What I'm Looking For", "")))
+
+            # Prominent LLM explanation button
+            st.markdown("<div style='margin-top:20px;'>", unsafe_allow_html=True)
+            llm_key = "llm_{}_{}_{}_{}".format(selected_name, peek_name, algorithm, table_name)
+            peek_score = next((m["score"] for m in my_matches if m["match"] == peek_name), 0.0)
+            peek_field_scores = {
+                f: cosine_sim(embeddings[selected_name][f], embeddings[peek_name][f])
+                for f in PROFILE_FIELDS
+                if embeddings[selected_name].get(f) is not None and embeddings[peek_name].get(f) is not None
+            }
+            if st.button(
+                "🤖 Explain this Match using LLMs",
+                key="btn_{}".format(llm_key),
+                type="primary",
+                use_container_width=True,
+            ):
+                with st.spinner("Asking GPT-4o-mini..."):
+                    result = call_llm(
+                        selected_name, peek_name, candidates,
+                        peek_field_scores, peek_score, algorithm,
+                        st.session_state.get("llm_prompt", DEFAULT_PROMPT),
+                    )
+                st.session_state[llm_key] = result
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            if llm_key in st.session_state:
+                result = st.session_state[llm_key]
+                if result:
+                    llm_score = result.get("score", "?")
+                    fit_drivers = result.get("fit_drivers", [])
+                    complementary = result.get("complementary_value", "")
+                    friction = result.get("friction", "")
+                    st.markdown(
+                        "<div class='explanation-box'>"
+                        "<strong>🤖 LLM Assessment: {}/10</strong><br><br>"
+                        "<strong>Why it works:</strong><br>{}"
+                        "<br><br><strong>Complementary value:</strong><br>{}"
+                        "<br><br><strong>Potential friction:</strong><br>{}"
+                        "</div>".format(
+                            llm_score,
+                            "<br>".join("• {}".format(d) for d in fit_drivers),
+                            complementary,
+                            friction,
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.warning("LLM call failed — check your API key or try again.")
 
     # Cross-algorithm comparison
     st.markdown("---")
