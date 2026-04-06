@@ -55,13 +55,21 @@ Field breakdown:
 Return a JSON object with exactly these fields:
 {{
   "score": <integer 1-10, your independent assessment of match quality>,
-  "fit_drivers": ["<reason 1 referencing actual profile details>", "<reason 2>"],
+  "fit_drivers": ["<reason 1>", "<reason 2>"],
   "complementary_value": "<one sentence: what each person brings that the other lacks>",
   "friction": "<one sentence: potential challenges in this pairing>"
 }}
 
-Be direct. Use their names. Reference actual details from their profiles.
-Return ONLY the JSON.\
+Your output must follow these strictly:
+- Do NOT reproduce, quote, or reference specific sensitive details
+- Describe backgrounds in general terms only. For example:
+    Use "public sector / government experience" not specific agencies or roles.
+    Use "experience in finance or M&A" not specific transactions or clients.
+    Use "technical or engineering background" not specific projects or patents.
+- Focus on themes, transferable skills, and alignment of goals.
+- Be constructive and encouraging in tone.
+
+Use their first names only. Return ONLY the JSON.\
 """
 
 PROFILE_FIELDS = [
@@ -350,6 +358,19 @@ def compute_embeddings(candidates_list, table_name):
 
 with st.sidebar:
     st.header("🎯 Match Explorer")
+    st.markdown("---")
+
+    # ── API Key entry ──────────────────────────────────
+    st.markdown("**🔑 OpenAI API Key**")
+    user_api_key = st.text_input(
+        "OpenAI API Key",
+        type="password",
+        placeholder="sk-...  (leave blank to use class key)",
+        label_visibility="collapsed",
+        help="Paste your personal OpenAI API key here. It is never stored — only active for this session.",
+    )
+    if user_api_key:
+        OPENAI_API_KEY = user_api_key
     st.markdown("---")
 
     table_choice = st.radio(
