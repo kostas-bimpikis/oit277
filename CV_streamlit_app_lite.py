@@ -86,7 +86,7 @@ PROFILE_FIELDS = [
 ]
 
 TABLE_MAP = {
-    "Class Profiles": "Candidates_Real",
+    "Class Profiles": "Candidates_Class",
     "Practice Data (Synthetic)": "Candidates_Synthetic",
 }
 
