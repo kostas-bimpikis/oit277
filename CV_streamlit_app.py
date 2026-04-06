@@ -475,8 +475,20 @@ if not candidates_list:
 candidates = {row["Name"]: row for row in candidates_list}
 names = sorted(candidates.keys())
 
-# Generate embeddings (shows progress bar on first load; cached in session_state after)
-embeddings = compute_embeddings(candidates_list, table_name)
+# Check if embeddings are already cached; if not, wait for user to click button
+cache_key = "embeddings_{}".format(table_name)
+if cache_key not in st.session_state:
+    st.info(
+        "**{} profiles** loaded from Airtable. "
+        "If you'd like to use your own OpenAI API key, paste it in the sidebar first. "
+        "Then click the button below to compute embeddings.".format(len(names))
+    )
+    if st.button("🚀 Compute Embeddings", type="primary", use_container_width=True):
+        compute_embeddings(candidates_list, table_name)
+        st.rerun()
+    st.stop()
+
+embeddings = st.session_state[cache_key]
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # BUILD SCORER FUNCTION
